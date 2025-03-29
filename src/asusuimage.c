@@ -144,6 +144,8 @@ typedef struct {
 	uint32_t	buildno;
 	uint32_t	r16;
 	uint32_t	r32;
+	char *		new_arch_type;
+    char *		new_os_type;
 } trx_opt_t;
 
 trx_opt_t g_def = {0};
@@ -235,6 +237,8 @@ void usage(int status)
 	fprintf(fp, "    -f <number>    tail flags (def: %X) \n", g_def.flags);
 	fprintf(fp, "    -e <number>    tail ext no (def: %u) \n", g_def.extendno);
 	fprintf(fp, "    -b <number>    tail build no (def: %u) \n", g_def.buildno);
+	fprintf(fp, "    -A <string>    patch kernel arch in FDT \n");
+	fprintf(fp, "    -O <string>    patch kernel os-type in FDT \n");
 	fprintf(fp, "    -h             show this screen \n");
 	exit(status);
 }
@@ -245,7 +249,7 @@ int parse_args(int argc, char ** argv)
 	char *str, *end;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "Dxi:o:n:K:F:v:m:t:f:e:b:h?")) != -1) {
+	while ((opt = getopt(argc, argv, "Dxi:o:n:K:F:v:m:t:f:e:b:A:O:h?")) != -1) {
 		switch (opt) {
 		case 'i':
 			g_opt.imagefn = optarg;
@@ -312,6 +316,12 @@ int parse_args(int argc, char ** argv)
 			g_opt.buildno = strtoul(optarg, &end, 0);
 			if (end == optarg)
 				ERR("Incorrect -b argument!");
+			break;
+		case 'A':
+			g_opt.new_arch_type = optarg;
+			break;
+		case 'O':
+			g_opt.new_os_type = optarg;
 			break;
 		case 'h':
 		default:
@@ -526,6 +536,78 @@ static int show_info(char *img, size_t img_size)
 }
 
 static
+int patch_fdt_os_type(void * fdt_image)
+{
+    uint8_t * image = (uint8_t *)fdt_image;
+    uint32_t fdt_size;
+    size_t pos;
+    fdt_property_t * prop;
+    fdt_property_t * prop_arch = NULL;
+    fdt_property_t * prop_os = NULL;
+    size_t vlen;
+    
+    DBG("PATCH: 001 '%s' '%s' \n", g_opt.new_os_type, g_opt.new_arch_type);
+    if (be32toh(*(uint32_t *)image) != FDT_MAGIC)
+        return 0;
+    
+    DBG("PATCH: 003 \n");
+    fdt_size = be32toh(((uint32_t *)image)[1]);
+    //if (fdt_size > image_size)
+    //    ERR("PATCH: FDT size too big (0x%X > 0x%X)", fdt_size, image_size)
+    for (pos = 0; pos < fdt_size - sizeof(fdt_property_t); pos += 4) {
+        prop = (fdt_property_t *)(image + pos);
+        if (be32toh(prop->tag) != FDT_PROP || be32toh(prop->len) != 7)
+            continue;
+        if (prop->data[6] != 0 || strcmp(prop->data, "kernel") != 0)
+            continue;
+        prop++;
+        if (be32toh(prop->tag) != FDT_PROP || be32toh(prop->len) != 6)
+            continue;
+        if (prop->data[5] != 0 || strcmp(prop->data, "arm64") != 0)
+            continue;
+        prop_arch = prop;
+        prop++;
+        if (be32toh(prop->tag) != FDT_PROP || be32toh(prop->len) != 6)
+            continue;
+        if (prop->data[5] != 0 || strcmp(prop->data, "linux") != 0)
+            continue;
+        prop_os = prop;
+        break;
+    }
+    if (!prop_os) {
+        DBG("PATCH: FDT os-type offset not found! \n");
+        ERR("PATCH: FDT os-type offset not found! ");
+        return -1;
+    }
+    DBG("PATCH: FDT os-type offset: 0x%lX \n", (size_t)(prop->data) - (size_t)fdt_image);
+    if (g_opt.new_os_type && prop_os) {
+        prop = prop_os;
+        vlen = strlen(g_opt.new_os_type);
+        if (vlen >= 8) {
+            ERR("PATCH: Incorrect length of os-type: \"%s\" ", g_opt.new_os_type);
+        }
+        memset(prop->data, 0, sizeof(prop->data));
+        strncpy(prop->data, g_opt.new_os_type, sizeof(prop->data));
+        vlen += 1;
+        prop->len = (vlen >= 5) ? htobe32(vlen) : htobe32(5);
+        DBG("PATCH: FDT os-type patched to value: \"%s\" \n", g_opt.new_os_type);
+    }
+    if (g_opt.new_arch_type && prop_arch) {
+        prop = prop_arch;
+        vlen = strlen(g_opt.new_arch_type);
+        if (vlen >= 8) {
+            ERR("PATCH: Incorrect length of arch: \"%s\" ", g_opt.new_arch_type);
+        }
+        memset(prop->data, 0, sizeof(prop->data));
+        strncpy(prop->data, g_opt.new_arch_type, sizeof(prop->data));
+        vlen += 1;
+        prop->len = (vlen >= 5) ? htobe32(vlen) : htobe32(5);
+        DBG("PATCH: FDT arch patched to value: \"%s\" \n", g_opt.new_arch_type);
+    }
+    return 1;
+}
+
+static
 int sync_trx_header_with_fdt(image_header_t * hdr, const fdt_header_t * fdt)
 {
 	const size_t hsz = sizeof(image_header_t);
@@ -676,6 +758,12 @@ int process_image(void)
 
 	data_crc_c = crc32(0, (const unsigned char *)(img + hsz), data_size);
 	DBG("data: crc = %08X  (%08X) \n", be32toh(hdr->ih_dcrc), data_crc_c);
+
+    if (g_opt.new_os_type || g_opt.new_arch_type) {
+        if (be32toh(hdr->ih_type) != IH_TYPE_KERNEL)
+            ERR("PATCH: incorrect options! Supported only IH_TYPE_KERNEL images!");
+        patch_fdt_os_type(img + hsz);
+    }
 
 	DBG("TRX image type: %d \n", (int)hdr->ih_type);
 

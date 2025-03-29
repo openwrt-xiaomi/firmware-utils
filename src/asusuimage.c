@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
@@ -20,18 +21,25 @@
 #include <byteswap.h>
 #include <zlib.h> /* crc32 */
 
-/* Various defines picked from U-boot */
+#include "fdt.h"
 
-#define FDT_MAGIC	0xD00DFEED
+/* Various defines picked from U-boot */
 
 #define IH_MAGIC	0x27051956
 
 #define IH_OS_LINUX	5
+#define IH_OS_U_BOOT	17
 
+#define IH_ARCH_ARM	2
+#define IH_ARCH_MIPS	5
 #define IH_ARCH_ARM64	22
 
-#define IH_TYPE_KERNEL	2
-#define IH_TYPE_MULTI	4
+#define IH_TYPE_KERNEL		2
+#define IH_TYPE_RAMDISK		3
+#define IH_TYPE_MULTI		4
+#define IH_TYPE_FIRMWARE	5
+#define IH_TYPE_FLATDT		8
+#define IH_TYPE_KERNEL_NOLOAD	14
 
 #define IH_COMP_NONE	0
 
@@ -518,6 +526,115 @@ static int show_info(char *img, size_t img_size)
 }
 
 static
+int sync_trx_header_with_fdt(image_header_t * hdr, const fdt_header_t * fdt)
+{
+	const size_t hsz = sizeof(image_header_t);
+	int64_t val;
+	const char * kpath = "/images/kernel*/";
+	const char * os;
+	const char * arch;
+	const char * type;
+
+	DBG("TRX: sync_trx_header_with_fdt \n");
+	if (!fdt)
+		fdt = (const fdt_header_t *)((char *)hdr + hsz);
+	
+	if (be32toh(fdt->magic) != FDT_MAGIC)
+		return -9;
+	
+	DBG("TRX: parse FDT... \n");
+	val = get_fdt_prop_u32(fdt, kpath, "load");
+	if (val < 0)
+		return -10;
+	
+	DBG("TRX: kernel load addr: 0x%08X \n", (uint32_t)val);
+	hdr->ih_load = htobe32((uint32_t)val);
+
+	val = get_fdt_prop_u32(fdt, kpath, "entry");
+	if (val < 0)
+		return -11;
+	
+	DBG("TRX: kernel entry point: 0x%08X \n", (uint32_t)val);
+	hdr->ih_ep = htobe32((uint32_t)val);
+	
+	os = get_fdt_prop_str(fdt, kpath, "os");
+	if (!os)
+		return -12;
+
+	if (strcmp(os, "linux") == 0)
+		hdr->ih_os = IH_OS_LINUX;
+	else
+	if (strcmp(os, "u-boot") == 0)
+		hdr->ih_os = IH_OS_U_BOOT;
+	else
+		return -13;
+
+	arch = get_fdt_prop_str(fdt, kpath, "arch");
+	if (!arch)
+		return -14;
+
+	if (strcmp(arch, "arm") == 0)
+		hdr->ih_arch = IH_ARCH_ARM;
+	else
+	if (strcmp(arch, "arm64") == 0)
+		hdr->ih_arch = IH_ARCH_ARM64;
+	else
+	if (strcmp(arch, "mips") == 0)
+		hdr->ih_arch = IH_ARCH_MIPS;
+	else
+		return -15;
+
+	type = get_fdt_prop_str(fdt, kpath, "type");
+	if (!type)
+		return -16;
+
+	if (strcmp(type, "kernel") == 0)
+		hdr->ih_type = IH_TYPE_KERNEL;
+	else
+	if (strcmp(type, "firmware") == 0)
+		hdr->ih_type = IH_TYPE_FIRMWARE;
+	else
+	if (strcmp(type, "kernel_noload") == 0)
+		hdr->ih_type = IH_TYPE_KERNEL_NOLOAD;
+	else
+		return -17;
+	
+	return 0;
+}
+
+static
+int create_trx_header(char * img, size_t * img_size)
+{
+	const size_t hsz = sizeof(image_header_t);
+	image_header_t * hdr;
+	const fdt_header_t * fdt;
+	int rc;
+	
+	DBG("TRX: create_trx_header \n");
+	hdr = (image_header_t *)img;
+	memmove(img + hsz, img, *img_size);
+	memset(hdr, 0, hsz);
+	hdr->ih_magic = htobe32(IH_MAGIC);
+	hdr->ih_time = htobe32(get_timestamp());
+	hdr->ih_size = htobe32(*img_size);
+	hdr->ih_load = 0;
+	hdr->ih_ep   = 0;
+	hdr->ih_os   = IH_OS_LINUX;
+	hdr->ih_arch = IH_ARCH_ARM64;
+	hdr->ih_type = IH_TYPE_KERNEL;
+	hdr->ih_comp = IH_COMP_NONE;
+	*img_size += hsz;
+
+	fdt = (const fdt_header_t *)(img + hsz);
+	if (be32toh(fdt->magic) == FDT_MAGIC) {
+		rc = sync_trx_header_with_fdt(hdr, fdt);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+static
 int process_image(void)
 {
 	const uint32_t hsz = sizeof(image_header_t);
@@ -537,6 +654,7 @@ int process_image(void)
 	tail_footer_t *foot;
 	trx2_t *trx;
 	FILE *fp;
+	int rc;
 
 	img = load_image(1024, &img_size);
 	if (!img)
@@ -547,18 +665,9 @@ int process_image(void)
 
 	hdr = (image_header_t *)img;
 	if (be32toh(hdr->ih_magic) != IH_MAGIC) {
-		memmove(img + hsz, img, img_size);
-		memset(hdr, 0, hsz);
-		hdr->ih_magic = htobe32(IH_MAGIC);
-		hdr->ih_time = htobe32(get_timestamp());
-		hdr->ih_size = htobe32(img_size);
-		hdr->ih_load = 0;
-		hdr->ih_ep   = 0;
-		hdr->ih_os   = IH_OS_LINUX;
-		hdr->ih_arch = IH_ARCH_ARM64;
-		hdr->ih_type = IH_TYPE_KERNEL;
-		hdr->ih_comp = IH_COMP_NONE;
-		img_size += hsz;
+		rc = create_trx_header(img, &img_size);
+		if (rc)
+			ERR("Cannot create TRX header! ERR = %d", rc);
 	}
 	data_size = (uint32_t)be32toh(hdr->ih_size);
 	DBG("data: size = 0x%08X  (%u bytes) \n", data_size, data_size);
@@ -568,7 +677,7 @@ int process_image(void)
 	data_crc_c = crc32(0, (const unsigned char *)(img + hsz), data_size);
 	DBG("data: crc = %08X  (%08X) \n", be32toh(hdr->ih_dcrc), data_crc_c);
 
-	DBG("image type: %d \n", (int)hdr->ih_type);
+	DBG("TRX image type: %d \n", (int)hdr->ih_type);
 
 	img_end = img + img_size;
 
@@ -582,13 +691,18 @@ int process_image(void)
 		prod_name = hdr->tail.trx3.prod_name;
 		max_prod_len = sizeof(hdr->tail.trx3.prod_name);
 		break;
+	default:
+		ERR("Incorrect option -v");
 	}
 
 	prod_name_str = (const char *)&hdr->kernel_ver;
 	if (g_opt.prod_name[0])
 		prod_name_str = g_opt.prod_name;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
 	strncpy(prod_name, prod_name_str, max_prod_len);
+#pragma GCC diagnostic pop
 	hdr->kernel_ver = g_opt.kernel_ver;
 	hdr->fs_ver = g_opt.fs_ver;
 
@@ -606,7 +720,7 @@ int process_image(void)
 
 			for (uint32_t i = 0; i <= VOL_COUNT; i++) {
 				if (vol_size[i] == 0)
-			   		break;
+					break;
 				vol_count++;
 			}
 			DBG("Multi image: volumes count = %u \n", vol_count);
@@ -623,7 +737,7 @@ int process_image(void)
 				DBG("Multi image: volume %u has offset = 0x%08X \n", i, xoffset);
 				if (be32toh(vol_size[i]) > 0x4FFFFFF) {
 					free(img);
-			    		ERR("Multi image contain volume %u with huge size", i);
+					ERR("Multi image contain volume %u with huge size", i);
 				}
 
 				xoffset += be32toh(vol_size[i]);
